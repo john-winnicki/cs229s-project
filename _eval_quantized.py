@@ -20,7 +20,7 @@ device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
-dataset = 'shakespeare' # 'shakespeare' or 'wikitext'
+dataset = 'wikitext' # 'shakespeare' or 'wikitext'
 block_size = 1024
 # -----------------------------------------------------------------------------
 
@@ -49,7 +49,7 @@ val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r
 def measure_perplexity(model, data, batch_size):
     nll_weights = []
     nlls = []
-    for i in tqdm(range(0, len(data), block_size * batch_size)):
+    for i in range(0, len(data), block_size * batch_size):
         j = min(i + block_size * batch_size, len(data))
         ix = torch.arange(i, j, block_size)
         x = []
@@ -64,60 +64,72 @@ def measure_perplexity(model, data, batch_size):
             x = x.to(device)
         with torch.no_grad():
             with ctx:
-                y = x[:, 1:].clone()
-                x[x == -1] = 0
-                logits, loss = model(x[:, :-1], y)
-                nlls.append(loss)
-                # # https://github.com/huggingface/transformers/blob/df5c5c62ae253055336f5bb0828ca8e3e15ab6bd/src/transformers/models/gpt2/modeling_gpt2.py#L1099
-                # y = x.clone()
+                # y = x[:, 1:].clone()
                 # x[x == -1] = 0
-                # logits, _ = model(x, y)
-                # shift_logits = logits[..., :-1, :].contiguous()
-                # shift_labels = y[..., 1:].contiguous()
-                # loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-1)
+                # logits, loss = model(x[:, :-1], y)
                 # nlls.append(loss)
+                # # https://github.com/huggingface/transformers/blob/df5c5c62ae253055336f5bb0828ca8e3e15ab6bd/src/transformers/models/gpt2/modeling_gpt2.py#L1099
+                y = x.clone()
+                x[x == -1] = 0
+                logits, _ = model(x, y)
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = y[..., 1:].contiguous()
+                loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-1)
+                nlls.append(loss)
     nlls = [nll_weights[i] * nlls[i] for i in range(len(nlls))]
     return torch.exp(torch.stack(nlls).sum()).item()
 
+print("-" * 80 + "\nWithout quantization\n" + "-" * 80)
 # Load pre-trained model
 model_pt = GPT.from_pretrained(init_from, dict(dropout=0.0))
 model_pt.eval()
 torch.cuda.reset_peak_memory_stats(device=device)
 model_pt.to(device)
-print(f"GPU memory allocated after moving pre-trained model to device {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+print(f"GPU memory allocated after calling model.to(device) {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
 if compile:
     model_pt = torch.compile(model_pt) # requires PyTorch 2.0 (optional)
-
+# Run evaluation
 torch.cuda.reset_peak_memory_stats(device=device)
 ppl_pt_bs4 = measure_perplexity(model_pt, val_data, batch_size=4)
 print(f"GPT-2 perplexity on {dataset}/val.bin, batch_size={4}: {ppl_pt_bs4:.4f}")
 print(f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+print()
 ppl_pt_bs12 = measure_perplexity(model_pt, val_data, batch_size=12)
 print(f"GPT-2 perplexity on {dataset}/val.bin, batch_size={12}: {ppl_pt_bs12:.4f}")
 print(f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
 del model_pt
 gc.collect()
 torch.cuda.empty_cache()
+print("\n")
 
+print("-" * 80 + "\nWith quantization\n" + "-" * 80)
 # Load pre-trained model and quantize
 model_dq = GPT_Q.from_pretrained(init_from, dict(dropout=0.0))
 model_dq.quantize_all_parameters()
 torch.cuda.reset_peak_memory_stats(device=device)
 model_dq.to(device)
-print(f"GPU memory allocated after moving quantized model to device {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+print(f"GPU memory allocated after calling model.to(device) {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
 if compile:
     model_dq = torch.compile(model_dq) # requires PyTorch 2.0 (optional)
-
+# Run evaluation
 torch.cuda.reset_peak_memory_stats(device=device)
 ppl_dq_bs4 = measure_perplexity(model_dq, val_data, batch_size=4)
 print(f"GPT-2 dynamic quantized perplexity on {dataset}/val.bin, batch_size={4}: {ppl_dq_bs4:.4f}")
 print(f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+print()
 ppl_dq_bs12 = measure_perplexity(model_dq, val_data, batch_size=12)
 print(f"GPT-2 dynamic quantized perplexity on {dataset}/val.bin, batch_size={12}: {ppl_dq_bs12:.4f}")
 print(f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
 del model_dq
 gc.collect()
 torch.cuda.empty_cache()
+
+"""
+Next to do:
+1. Quantize attention projection matrices + biases
+2. Quantize activations
+3. Refactor code to be able to turn quantization on/off. E.g. turn biases off, wpe off, etc.
+"""
 
 # -----------------------------------------------------------------------------
 # To minimize gpu memory usage, would it help to shuffle tensors back and forth 
