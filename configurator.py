@@ -15,6 +15,7 @@ comes up with a better simple Python solution I am all ears.
 """
 
 import sys
+import os
 from ast import literal_eval
 
 for arg in sys.argv[1:]:
@@ -43,5 +44,7 @@ for arg in sys.argv[1:]:
             # cross fingers
             print(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt
+        elif key == 'local-rank':
+            globals()[key] = os.environ['LOCAL_RANK']
         else:
             raise ValueError(f"Unknown config key: {key}")

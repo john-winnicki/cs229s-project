@@ -1,12 +1,14 @@
 import os
 import time
 import math
-import pickle
+import json
 from contextlib import nullcontext
 
 import numpy as np
 import tiktoken
 import torch
+import torch.nn.functional as F 
+from torch.profiler import profile, record_function
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -28,8 +30,9 @@ wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'shakespeare'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 2 #11 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 4 #5 * 8 # used to simulate larger batch sizes
+batch_size = 4 #2 #11 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_split_size = 2
 block_size = 1024
 # model
 n_layer = 12
@@ -39,7 +42,7 @@ dropout = 0.1 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 5 # total number of training iterations
+max_iters = 1 # 5 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -82,7 +85,8 @@ else:
     seed_offset = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+if master_process:
+    print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -114,87 +118,77 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
+def init_model():
+    model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                    bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+    if init_from == 'scratch':
+        # init a new model from scratch
+        if master_process:
+            print(f"Initializing a new model from scratch : block_size {block_size}, batch_size {batch_size}")
+            # determine the vocab size we'll use for from-scratch training
+            print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        model_args['vocab_size'] = 50304
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    # removed 'resume' and 'gpt2' options
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+    # crop down the model block size if desired, using model surgery
+    if block_size < model.config.block_size:
+        model.crop_block_size(block_size)
+        model_args['block_size'] = block_size # so that the checkpoint will have the right value
+    model.to(device)
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
+    # initialize a GradScaler. If enabled=False scaler is a no-op
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    # optimizer
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+    # compile the model
+    if compile:
+        print("compiling the model... (takes a ~minute)")
+        unoptimized_model = model
+        model = torch.compile(model) # requires PyTorch 2.0
 
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    # wrap model into DDP container
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    
+    return model, model_args, optimizer, scaler
+
+model, model_args, optimizer, scaler = init_model()
+
+# partition layers across GPUs
+num_gpus = torch.cuda.device_count()
+layers_to_partition = model.transformer.h # 12 blocks of Self Attention + MLP
+partition_sizes = [len(layers_to_partition) // num_gpus] * num_gpus
+for i in range(len(layers_to_partition) % num_gpus):
+    partition_sizes[i] += 1
+
+partitions = []
+start = 0
+for i, size in enumerate(partition_sizes):
+    layers = torch.nn.Sequential() 
+    # Add the transformer blocks for this partition
+    for j in range(start, start + size):
+        layers.add_module(f"block_{j}", layers_to_partition[j])
+    partitions.append(layers)#.to(f'cuda:{i}'))
+    start += size
+
+def get_embedding(model, X):
+    _, t = X.size()
+    pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+    tok_emb = model.transformer.wte(X) # token embeddings of shape (b, t, n_embd)
+    pos_emb = model.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+    X = model.transformer.drop(tok_emb + pos_emb)
+    return X
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    model.to('cuda:0')
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
@@ -226,7 +220,14 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-print("\nMeasuring training quality\n")
+def sizeof_fmt(num, suffix="B"):
+    for unit in ["", "Ki", "Mi", "Gi", "Ti"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.2f}{unit}B"
+        num /= 1024.0
+
+if master_process:
+    print("\nMeasuring training quality\n")
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -234,262 +235,181 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-while True:
-    
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"{device} | saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
-        break
-    
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
+with profile(activities=[torch.profiler.ProfilerActivity.CUDA],
+             record_shapes=True) as prof:
+    while True:
+        
+        # determine and set the learning rate for this iteration
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        # evaluate the loss on train/val sets and write checkpoints
+        if iter_num % eval_interval == 0 and master_process:
+            losses = estimate_loss()
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"{device} | saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if iter_num == 0 and eval_only:
+            break
+        
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            with ctx:
+                X_splits = iter(X.split(batch_split_size, dim=0))
+                Y_splits = iter(Y.split(batch_split_size, dim=0))
+                X_next = next(X_splits)
+                #Y_next = next(Y_splits)
+                
+                # Embedding on GPU 0
+                X_prev = get_embedding(model, X_next)
+                X_prev = partitions[0](X_prev).to('cuda:1')
+                for X_next in X_splits:
+                    X_prev = partitions[1].to('cuda:1')(X_prev)                    
+                    X_prev = model.transformer.ln_f.to(f'cuda:1')(X_prev)
+                    X_prev = model.lm_head(X_prev.to(f'cuda:0'))
+                    
+                    loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1), ignore_index=-1)
+                    loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+                    X_prev = get_embedding(model, X_next)
+                    X_prev = partitions[0](X_prev).to('cuda:1')
+                
+                X_prev = partitions[1].to('cuda:1')(X_prev)                    
+                X_prev = model.transformer.ln_f.to(f'cuda:1')(X_prev)
+                
+                # X_prev = model.lm_head(X_prev.to(f'cuda:0'))
+                # loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1), ignore_index=-1)
+                
+                X_prev = model.lm_head.to(f'cuda:1')(X_prev)                
+                loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1).to(f'cuda:1'), ignore_index=-1)
+                
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = get_batch('train')
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+
+        # timing and logging
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if iter_num % log_interval == 0 and master_process:
+            # get loss as float. note: this is a CPU-GPU sync point
+            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+            lossf = loss.item() * gradient_accumulation_steps
+            if local_iter_num >= 5: # let the training loop settle a bit
+                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        iter_num += 1
+        local_iter_num += 1
+
+        # termination conditions
+        if iter_num > max_iters:
+            break
+
+# formatted_data = []
+# for event in prof.key_averages():
+#     tid = -1
+#     if hasattr(event, 'device_index') and event.device_index == event.device_index.CUDA:
+#         tid = event.device_index
+#     formatted_event = {
+#         "name": event.key,
+#         "ph": "Dummy value",  # You might need to adjust this based on the event type
+#         "ts": event.cpu_time_total + event.cuda_time_total,
+#         "dur": event.cpu_time + event.cuda_time,
+#         "pid": 0,
+#         "tid": tid,
+#     }
+#     formatted_data.append(formatted_event)
+
+# # Export to JSON file
+# with open("simplified_trace.json", "w") as file:
+#     json.dump(formatted_data, file)
+
+prof.export_chrome_trace("trace.json")
+
+print("Peak memory usage for GPUs: ", end="")
+for i in range(num_gpus):
+    print(
+        f"cuda:{i}: {sizeof_fmt(torch.cuda.memory_stats(i)['allocated_bytes.all.peak'])}, ",
+        end="",
+    )
 
 print()
 
 # -----------------------------------------------------------------------------
-# Inference
+# Training throughput
 # -----------------------------------------------------------------------------
-init_from = 'gpt2' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 1 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
-seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
-# -----------------------------------------------------------------------------
-
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-
-# model
-if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-
-model.eval()
-model.to(device)
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
-
-# look for the meta pickle in case it is available in the dataset folder
-load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"Loading meta from {meta_path}...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
-
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-
-# function to measure inference latency
-def measure_inference_latency(batch_size):
-    x = torch.tensor(start_ids * batch_size, dtype=torch.long, device=device).reshape(batch_size, -1)
-    with torch.no_grad():
-        with ctx:
-            tokens_decoded = 0
-            inference_start = time.time()
-            for k in range(num_samples):
-                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-                tokens_decoded += y.shape[0] * (y.shape[1] - 1)
-            inference_finish = time.time()
-    inference_total_seconds = inference_finish - inference_start
-    inference_tokens_per_second = tokens_decoded / inference_total_seconds
-    print(f"{device} | Inference latency, batch size {batch_size}: {inference_tokens_per_second:.4f} tokens/second")
-
-print("\nMeasuring inference latency\n")
-
-batch_size = 1
-measure_inference_latency(1)
-batch_size = 12
-measure_inference_latency(12)
-print()
-del model
-
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
-
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
-
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
 
 # function to measure training latency
-def measure_training_throughput(batch_size, max_iters=5):
+def measure_training_throughput(batch_size, block_size=128, max_iters=5):
+    
+    # model init
+    model, model_args, optimizer, scaler = init_model()
+
     times = []
     X, Y = get_batch('train') # fetch the very first batch
     t0 = time.time()
     # Do an extra iteration: first iteration is slower as get_batch doesn't overlap with backward pass
     for _ in range(max_iters + 1):
         with ctx:
-            logits, loss = model(X, Y)
+            _, t = X.size()
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            tok_emb = model.transformer.wte(X) # token embeddings of shape (b, t, n_embd)
+            pos_emb = model.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            X = model.transformer.drop(tok_emb + pos_emb)
+
+            for stage, partition in enumerate(partitions):
+                partition.to(f'cuda:{stage}')
+                X = partition(X)
+                # Move activations to next GPU (or keep on last GPU for final stage)
+                next_stage = min(stage + 1, num_gpus - 1)
+                X = X.to(f'cuda:{next_stage}')
+            
+            X = model.transformer.ln_f.to(f'cuda:{next_stage}')(X)
+            X = model.lm_head(X.to(f'cuda:0'))
+            
+            loss = F.cross_entropy(X.view(-1, X.size(-1)), Y.view(-1), ignore_index=-1)
+            
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch('train')
             scaler.scale(loss).backward()
@@ -515,7 +435,7 @@ print("\nMeasuring training throughput\n")
 
 batch_size = 4
 measure_training_throughput(batch_size)
-batch_size = 12
+batch_size = 6
 measure_training_throughput(batch_size)
 
 if ddp:

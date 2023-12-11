@@ -12,12 +12,16 @@ init_process_group(backend='nccl')
 if dist.get_rank() == 0:
     tensor = torch.randn(2).to('cuda:0')
     print(f'Tensor {tensor} set on GPU {dist.get_rank()}')
+    dist.broadcast(tensor, src=0)
+    tensor2 = torch.randn(2).to('cuda:0')
+    print(f'Tensor {tensor2} set on GPU {dist.get_rank()}')
+    dist.broadcast(tensor2, src=0)
 else:
-    tensor = torch.zeros(2).to('cuda:1')
-    print(f'Tensor {tensor} initialized on GPU {dist.get_rank()}, check GPU {tensor.device}')
-
-# Broadcasting tensor from GPU 0 to GPU 1
-dist.broadcast(tensor, src=0)
-print(f'Tensor {tensor} set from GPU {dist.get_rank()} on GPU {tensor.device}')
+    a = torch.zeros(2).to('cuda:1')
+    dist.broadcast(a, src=0)
+    print(f'Tensor {a} sent to GPU {dist.get_rank()}, check GPU {a.device}')
+    b = torch.zeros(2).to('cuda:1')
+    dist.broadcast(b, src=0)
+    print(f'Tensor {b} sent to GPU {dist.get_rank()}, check GPU {b.device}')
 
 destroy_process_group()

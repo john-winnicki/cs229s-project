@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F 
 from torch.profiler import profile, record_function
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, broadcast
 
 from model import GPTConfig, GPT
 
@@ -66,6 +66,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+actual_ddp = False # ddp is used for other checks, this new flag is for data parallelism specifically, separate from pipeline parallelism
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
@@ -152,7 +153,7 @@ def init_model():
         model = torch.compile(model) # requires PyTorch 2.0
 
     # wrap model into DDP container
-    if ddp:
+    if ddp and actual_ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
     
     return model, model_args, optimizer, scaler
@@ -233,8 +234,6 @@ if master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
 
 with profile(activities=[torch.profiler.ProfilerActivity.CUDA],
              record_shapes=True) as prof:
@@ -249,34 +248,13 @@ with profile(activities=[torch.profiler.ProfilerActivity.CUDA],
         if iter_num % eval_interval == 0 and master_process:
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'],
-                    "val/loss": losses['val'],
-                    "lr": lr,
-                    "mfu": running_mfu*100, # convert to percentage
-                })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
-                best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    print(f"{device} | saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         if iter_num == 0 and eval_only:
             break
         
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
         for micro_step in range(gradient_accumulation_steps):
-            if ddp:
+            if ddp and actual_ddp:
                 # in DDP training we only need to sync gradients at the last micro step.
                 # the official way to do this is with model.no_sync() context manager, but
                 # I really dislike that this bloats the code and forces us to repeat code
@@ -286,55 +264,47 @@ with profile(activities=[torch.profiler.ProfilerActivity.CUDA],
                 X_splits = iter(X.split(batch_split_size, dim=0))
                 Y_splits = iter(Y.split(batch_split_size, dim=0))
                 X_next = next(X_splits)
-                #Y_next = next(Y_splits)
-                
-                # Embedding on GPU 0
-                X_prev = get_embedding(model, X_next)
-                X_prev = partitions[0](X_prev).to('cuda:1')
                 for X_next in X_splits:
-                    X_prev = partitions[1].to('cuda:1')(X_prev)                    
-                    X_prev = model.transformer.ln_f.to(f'cuda:1')(X_prev)
-                    X_prev = model.lm_head(X_prev.to(f'cuda:0'))
-                    
-                    loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1), ignore_index=-1)
-                    loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-
-                    X_prev = get_embedding(model, X_next)
-                    X_prev = partitions[0](X_prev).to('cuda:1')
+                    if ddp_rank == 0:
+                        X_next = get_embedding(model, X_next)
+                        X_next = partitions[0](X_next)
+                        broadcast(X_next, src=0)
                 
-                X_prev = partitions[1].to('cuda:1')(X_prev)                    
-                X_prev = model.transformer.ln_f.to(f'cuda:1')(X_prev)
-                X_prev = model.lm_head(X_prev.to(f'cuda:0'))
-                
-                loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1), ignore_index=-1)
-                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+                    if ddp_rank == 1:
+                        X_prev = torch.zeros((batch_size//batch_split_size, block_size, n_embd)).to('cuda:1')
+                        broadcast(X_prev, src=0)
+                        X_prev = partitions[1].to('cuda:1')(X_prev)                    
+                        X_prev = model.transformer.ln_f.to(f'cuda:1')(X_prev)
+                        X_prev = model.lm_head.to(f'cuda:1')(X_prev)
+                        
+                        loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1).to(f'cuda:1'), ignore_index=-1)
+                        loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch('train')
             # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
+            if ddp_rank == 1:
+                scaler.scale(loss).backward()
         # clip the gradient
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        # step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)
-        scaler.update()
-        # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
+        if ddp_rank == 1:
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # step the optimizer and scaler if training in fp16
+            scaler.step(optimizer)
+            scaler.update()
+            # flush the gradients as soon as we can, no need for this memory anymore
+            optimizer.zero_grad(set_to_none=True)
 
         # timing and logging
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        if iter_num % log_interval == 0 and master_process:
+        if iter_num % log_interval == 0 and ddp_rank == 1:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             lossf = loss.item() * gradient_accumulation_steps
-            if local_iter_num >= 5: # let the training loop settle a bit
-                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
         iter_num += 1
         local_iter_num += 1
 
@@ -342,31 +312,12 @@ with profile(activities=[torch.profiler.ProfilerActivity.CUDA],
         if iter_num > max_iters:
             break
 
-# formatted_data = []
-# for event in prof.key_averages():
-#     tid = -1
-#     if hasattr(event, 'device_index') and event.device_index == event.device_index.CUDA:
-#         tid = event.device_index
-#     formatted_event = {
-#         "name": event.key,
-#         "ph": "Dummy value",  # You might need to adjust this based on the event type
-#         "ts": event.cpu_time_total + event.cuda_time_total,
-#         "dur": event.cpu_time + event.cuda_time,
-#         "pid": 0,
-#         "tid": tid,
-#     }
-#     formatted_data.append(formatted_event)
-
-# # Export to JSON file
-# with open("simplified_trace.json", "w") as file:
-#     json.dump(formatted_data, file)
-
-prof.export_chrome_trace("trace.json")
+prof.export_chrome_trace(f"trace{ddp_local_rank}.json")
 
 print("Peak memory usage for GPUs: ", end="")
 for i in range(num_gpus):
     print(
-        f"cuda:{i}: {sizeof_fmt(torch.cuda.memory_stats(i)['allocated_bytes.all.peak'])}, ",
+        f"cuda:{i}: {sizeof_fmt(torch.cuda.max_memory_allocated(i))}, ",
         end="",
     )
 
@@ -388,21 +339,25 @@ def measure_training_throughput(batch_size, block_size=128, max_iters=5):
     # Do an extra iteration: first iteration is slower as get_batch doesn't overlap with backward pass
     for _ in range(max_iters + 1):
         with ctx:
-            _, t = X.size()
-            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-            tok_emb = model.transformer.wte(X) # token embeddings of shape (b, t, n_embd)
-            pos_emb = model.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-            X = model.transformer.drop(tok_emb + pos_emb)
-
-            for stage, partition in enumerate(partitions):
-                partition.to(f'cuda:{stage}')
-                X = partition(X)
-                # Move activations to next GPU (or keep on last GPU for final stage)
-                next_stage = min(stage + 1, num_gpus - 1)
-                X = X.to(f'cuda:{next_stage}')
+            X_splits = iter(X.split(batch_split_size, dim=0))
+            Y_splits = iter(Y.split(batch_split_size, dim=0))
+            X_next = next(X_splits)
+            for X_next in X_splits:
+                if ddp_rank == 0:
+                    X_next = get_embedding(model, X_next)
+                    X_next = partitions[0](X_next)
+                    broadcast(X_next, src=0)
             
-            X = model.transformer.ln_f.to(f'cuda:{next_stage}')(X)
-            X = model.lm_head(X.to(f'cuda:0'))
+                if ddp_rank == 1:
+                    X_prev = torch.zeros((batch_size//batch_split_size, block_size, n_embd)).to('cuda:1')
+                    broadcast(X_prev, src=0)
+                    X_prev = partitions[1].to('cuda:1')(X_prev)                    
+                    X_prev = model.transformer.ln_f.to(f'cuda:1')(X_prev)
+                    X_prev = model.lm_head.to(f'cuda:1')(X_prev)
+                    
+                    loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1).to(f'cuda:1'), ignore_index=-1)
+                    loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+
             
             loss = F.cross_entropy(X.view(-1, X.size(-1)), Y.view(-1), ignore_index=-1)
             
