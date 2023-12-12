@@ -45,15 +45,15 @@ gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 
-# # model
-# n_layer = 12
-# n_head = 12
-# n_embd = 768
-
 # model
-n_layer = 6
-n_head = 6
-n_embd = 384
+n_layer = 12
+n_head = 12
+n_embd = 768
+
+# # model
+# n_layer = 6
+# n_head = 6
+# n_embd = 384
 
 dropout = 0.1 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
@@ -597,6 +597,9 @@ if wandb_log and master_process:
 
 print("\nMeasuring training quality\n")
 
+steps_since_prune = 0
+prune_amount = 0
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -607,10 +610,10 @@ while True:
 
     ############################################################
     ############################################################
-    if iter_num>=100 and iter_num%100==0: 
-        model.eval()
-        inferMe(model)
-        model.train()
+    # if iter_num>=100 and iter_num%100==0: 
+    #     model.eval()
+    #     inferMe(model)
+    #     model.train()
     ############################################################
     ############################################################
 
@@ -620,14 +623,14 @@ while True:
     #JOHN 12/11/2023
 
     #STRUCTURED
-    if iter_num>=100 and iter_num%100==0:
-        prune_gpt_model(model, pruning_percentage=percentages_to_reduce_each_step[int((iter_num//100) - 1)]/100)
-        print("Iteration", iter_num, "PRUNED")
+    # if iter_num>=100 and iter_num%100==0:
+    #     prune_gpt_model(model, pruning_percentage=percentages_to_reduce_each_step[int((iter_num//100) - 1)]/100)
+    #     print("Iteration", iter_num, "PRUNED")
 
     # #UNSTRUCTURED
-    # if iter_num>=100 and iter_num%50==0:
-    #     prune_gpt_model(model, pruning_percentage=iter_num/500-0.1)
-    #     print("Iteration", iter_num, "PRUNED",(iter_num/500-0.3)*100, "Percent of Graph")
+    # if iter_num>=100 and iter_num%100==0:
+    #     prune_gpt_model(model, pruning_percentage=iter_num/1000)
+    #     print("Iteration", iter_num, "PRUNED",iter_num/1000, "Percent of Graph")
 
     ############################################################
     ############################################################
@@ -639,6 +642,7 @@ while True:
         param_group['lr'] = lr
     
     # evaluate the loss on train/val sets and write checkpoints
+    #JOHN 12/11/2023: COMMENTED OUT THIS PART SINCE UNNECESSARY
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -721,12 +725,24 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+        #JOHN CHANGE 12/11/2023
+        if iter_num>=50 and lossf<=3.2 and steps_since_prune>=25:
+            prune_amount = prune_amount + 0.1
+            prune_gpt_model(model, pruning_percentage=prune_amount)
+            print("Iteration", iter_num, "PRUNED",prune_amount*100, "Percent of Graph")
+            steps_since_prune = 0
+        steps_since_prune += 1
+
+
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     #JOHN CHANGE 12/11/2023
-    if iter_num >= 1100:
+    # if iter_num >= 1000:
+        # break
+    if prune_amount==0.9:
         break
 
 
